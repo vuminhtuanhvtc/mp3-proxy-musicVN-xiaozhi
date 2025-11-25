@@ -1,6 +1,7 @@
 /**
- * Xiaozhi Adapter - TƯƠNG THÍCH VỚI CODE ESP32 GỐC
- * Trả về RELATIVE PATH thay vì FULL URL (ESP32 tự ghép base_url)
+ * Xiaozhi Adapter - TƯƠNG THÍCH 100% VỚI CODE ESP32 C++
+ * SỬA ĐỔI: Hỗ trợ biến môi trường PUBLIC_URL cho DDNS/Domain
+ * CẬP NHẬT: Mapping key giống hệt server gốc (cover_url, audio_full_url...)
  */
 
 const express = require('express');
@@ -8,7 +9,10 @@ const axios = require('axios');
 
 const app = express();
 const PORT = process.env.PORT || 5006;
+// URL của Backend ZMP3 (Container mp3-api)
 const MP3_API_URL = process.env.MP3_API_URL || 'http://mp3-api:5555';
+// URL Public (DDNS/Domain) nếu có. VD: http://my-domain.com:5006
+const PUBLIC_URL = process.env.PUBLIC_URL;
 
 // CACHE ĐƠN GIẢN
 const audioCache = new Map(); // {songId: Buffer}
@@ -51,6 +55,21 @@ app.get('/stream_pcm', async (req, res) => {
         const topSongs = songs.slice(0, 1);
         console.log(`✅ Found ${topSongs.length} songs`);
 
+        // ===== XÁC ĐỊNH BASE URL (ƯU TIÊN PUBLIC_URL) =====
+        let baseUrl;
+        if (PUBLIC_URL) {
+            // Nếu có cấu hình PUBLIC_URL trong docker-compose, dùng nó
+            // Xóa dấu / ở cuối nếu người dùng lỡ tay thêm vào
+            baseUrl = PUBLIC_URL.replace(/\/$/, '');
+            console.log(`🌐 Using Configured Public URL: ${baseUrl}`);
+        } else {
+            // Fallback: Tự động phát hiện IP nội bộ
+            const protocol = 'http'; 
+            const host = req.headers.host; 
+            baseUrl = `${protocol}://${host}`;
+            console.log(`🏠 Using Auto-detected Local URL: ${baseUrl}`);
+        }
+
         // ===== PRE-DOWNLOAD AUDIO =====
         const results = [];
         for (const songItem of topSongs) {
@@ -64,6 +83,7 @@ app.get('/stream_pcm', async (req, res) => {
             console.log(`🎵 Processing: ${songItem.title} (ID: ${songId})`);
 
             // Pre-download nếu chưa có trong cache
+            let fromCache = false;
             if (!audioCache.has(songId)) {
                 console.log(`⬇️ Pre-downloading audio for ${songId}...`);
                 try {
@@ -82,31 +102,43 @@ app.get('/stream_pcm', async (req, res) => {
 
                     // Lưu vào cache
                     audioCache.set(songId, audioBuffer);
-
-                    // Giới hạn cache size
                     if (audioCache.size > CACHE_MAX_SIZE) {
                         const firstKey = audioCache.keys().next().value;
                         audioCache.delete(firstKey);
-                        console.log(`🗑️ Removed ${firstKey} from cache`);
                     }
                 } catch (error) {
                     console.error(`❌ Failed to pre-download ${songId}: ${error.message}`);
                     continue;
                 }
             } else {
+                fromCache = true;
                 console.log(`✅ Using cached audio for ${songId}`);
             }
 
-            // ===== QUAN TRỌNG: TRẢ VỀ RELATIVE PATH (ESP32 TỰ GHÉP BASE_URL) =====
+            // ===== QUAN TRỌNG: MAPPING GIỐNG HỆT SERVER TRUNG QUỐC =====
+            const audioLink = `${baseUrl}/proxy_audio?id=${songId}`;
             results.push({
                 title: songItem.title || song,
                 artist: songItem.artistsNames || artist || 'Unknown',
-                // ✅ RELATIVE PATH - ESP32 sẽ tự ghép với base_url
-                audio_url: `/proxy_audio?id=${songId}`,
-                lyric_url: `/proxy_lyric?id=${songId}`,
-                thumbnail: songItem.thumbnail || songItem.thumbnailM || '',
+                
+                // Link chính
+                audio_url: audioLink,
+                
+                // Link phụ (Fake cho giống mẫu, trỏ về cùng 1 file)
+                audio_full_url: audioLink,
+                m3u8_url: audioLink, // ESP32 này không dùng m3u8 nhưng để vào cho đủ bộ
+                
+                lyric_url: `${baseUrl}/proxy_lyric?id=${songId}`,
+                
+                // Đổi 'thumbnail' thành 'cover_url' để khớp với server gốc
+                cover_url: songItem.thumbnail || songItem.thumbnailM || '',
+                
                 duration: songItem.duration || 0,
-                language: 'unknown'
+                
+                // Metadata giả lập
+                from_cache: fromCache,
+                // Trả về IP/Domain từ baseUrl để giống format gốc
+                ip: baseUrl.replace('http://', '').replace('https://', '').split(':')[0]
             });
         }
 
@@ -114,13 +146,8 @@ app.get('/stream_pcm', async (req, res) => {
             return res.status(500).json({ error: 'Failed to process any songs' });
         }
 
-        // ===== FORMAT RESPONSE ĐƠN GIẢN - ESP32 GỐC CHỈ XỬ LÝ 1 BÀI =====
         const response = results[0];
-
-        console.log(`✅ Returning song with RELATIVE paths`);
-        console.log(`   Audio: ${response.audio_url}`);
-        console.log(`   Lyric: ${response.lyric_url}`);
-        
+        console.log(`✅ Returning song (BaseURL: ${baseUrl})`);
         res.json(response);
 
     } catch (error) {
@@ -128,6 +155,8 @@ app.get('/stream_pcm', async (req, res) => {
         res.status(500).json({ error: 'Internal server error' });
     }
 });
+
+// ... (Các phần còn lại giữ nguyên) ...
 
 // ===== PROXY AUDIO TỪ CACHE =====
 app.get('/proxy_audio', async (req, res) => {
@@ -137,45 +166,34 @@ app.get('/proxy_audio', async (req, res) => {
             return res.status(400).send('Missing id parameter');
         }
 
-        console.log(`🎵 Serving audio for song ID: ${id}`);
-
         // Lấy từ cache
         if (audioCache.has(id)) {
             const audioBuffer = audioCache.get(id);
-            console.log(`✅ Serving ${audioBuffer.length} bytes from cache`);
-
             res.set({
                 'Content-Type': 'audio/mpeg',
                 'Content-Length': audioBuffer.length,
                 'Accept-Ranges': 'bytes',
                 'Cache-Control': 'public, max-age=86400'
             });
-
             res.send(audioBuffer);
         } else {
-            // Nếu không có trong cache, download mới
-            console.log(`⚠️ Not in cache, downloading...`);
+            // Fallback download
             const streamUrl = `${MP3_API_URL}/api/song/stream?id=${id}`;
-            
             const audioResponse = await axios({
                 method: 'GET',
                 url: streamUrl,
                 responseType: 'arraybuffer',
                 timeout: 120000
             });
-
             const audioBuffer = Buffer.from(audioResponse.data);
             audioCache.set(id, audioBuffer);
-
             res.set({
                 'Content-Type': 'audio/mpeg',
                 'Content-Length': audioBuffer.length,
                 'Accept-Ranges': 'bytes'
             });
-
             res.send(audioBuffer);
         }
-
     } catch (error) {
         console.error('❌ Proxy audio error:', error.message);
         res.status(500).send('Failed to proxy audio');
@@ -190,14 +208,11 @@ app.get('/proxy_lyric', async (req, res) => {
             return res.status(400).send('Missing id parameter');
         }
 
-        console.log(`📝 Serving lyric for song ID: ${id}`);
-
         const lyricUrl = `${MP3_API_URL}/api/lyric?id=${id}`;
         const response = await axios.get(lyricUrl, { timeout: 10000 });
 
         if (response.data && response.data.err === 0 && response.data.data) {
             const lyricData = response.data.data;
-            
             if (lyricData.file) {
                 const lyricContent = await axios.get(lyricData.file);
                 res.set('Content-Type', 'text/plain; charset=utf-8');
@@ -222,9 +237,7 @@ app.get('/proxy_lyric', async (req, res) => {
         } else {
             res.status(404).send('Lyric not found');
         }
-
     } catch (error) {
-        console.error('❌ Proxy lyric error:', error.message);
         res.status(404).send('Lyric not found');
     }
 });
@@ -239,9 +252,12 @@ app.get('/health', (req, res) => {
 
 app.listen(PORT, () => {
     console.log('='.repeat(60));
-    console.log(`🎵 Xiaozhi Adapter (ESP32 COMPATIBLE) on port ${PORT}`);
+    console.log(`🎵 Xiaozhi Adapter (PUBLIC URL SUPPORT) on port ${PORT}`);
     console.log(`🔗 MP3 API: ${MP3_API_URL}`);
-    console.log(`💾 Cache enabled (max ${CACHE_MAX_SIZE} songs)`);
-    console.log(`✅ Returns RELATIVE PATHS (ESP32 auto-builds full URL)`);
+    if (PUBLIC_URL) {
+        console.log(`🌍 PUBLIC_URL set: ${PUBLIC_URL}`);
+    } else {
+        console.log(`🏠 No PUBLIC_URL set, using auto-detection`);
+    }
     console.log('='.repeat(60));
 });
